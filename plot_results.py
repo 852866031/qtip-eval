@@ -28,13 +28,25 @@ import numpy as np
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT        = os.path.dirname(__file__)
 RESULTS_DIR = os.path.join(ROOT, 'results')
-DEQUANT_DIR = os.path.join(RESULTS_DIR, 'dequant')
-FUSED_DIR   = os.path.join(RESULTS_DIR, 'fused')
 DATA_DIR    = os.path.join(ROOT, 'data')
 
-DEQUANT_CSV      = os.path.join(DEQUANT_DIR, 'results.csv')
-FUSED_CSV        = os.path.join(FUSED_DIR,   'results.csv')
-QUANT_TIMING_CSV = os.path.join(DATA_DIR,    'quant_timings.csv')
+QUANT_TIMING_CSV = os.path.join(DATA_DIR, 'quant_timings.csv')
+
+
+def discover_gpu_dirs():
+    """Return sorted list of GPU slug names that have at least one results CSV."""
+    if not os.path.isdir(RESULTS_DIR):
+        return []
+    gpus = []
+    for entry in sorted(os.listdir(RESULTS_DIR)):
+        gpu_dir = os.path.join(RESULTS_DIR, entry)
+        if not os.path.isdir(gpu_dir):
+            continue
+        has_dequant = os.path.exists(os.path.join(gpu_dir, 'dequant', 'results.csv'))
+        has_fused   = os.path.exists(os.path.join(gpu_dir, 'fused',   'results.csv'))
+        if has_dequant or has_fused:
+            gpus.append(entry)
+    return gpus
 
 # ── Style ─────────────────────────────────────────────────────────────────────
 FP16_COLOR   = '#555555'
@@ -312,59 +324,71 @@ def plot_bandwidth_comparison(fp16_dq, dq_quant, fp16_fu, fu_quant, out_path):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
-    fp16_dq, dq_quant = load_csv(DEQUANT_CSV)
-    fp16_fu, fu_quant = load_csv(FUSED_CSV)
+def plot_for_gpu(gpu, quant_timings):
+    """Generate all plots for a single GPU slug."""
+    gpu_dir     = os.path.join(RESULTS_DIR, gpu)
+    dequant_dir = os.path.join(gpu_dir, 'dequant')
+    fused_dir   = os.path.join(gpu_dir, 'fused')
+
+    fp16_dq, dq_quant = load_csv(os.path.join(dequant_dir, 'results.csv'))
+    fp16_fu, fu_quant = load_csv(os.path.join(fused_dir,   'results.csv'))
 
     have_dequant = fp16_dq is not None
     have_fused   = fp16_fu is not None
     have_both    = have_dequant and have_fused
 
-    if not have_dequant and not have_fused:
-        sys.exit("No results CSVs found. Run benchmark_dequant.py and/or benchmark_fused.py first.")
-
-    print("Generating plots...")
+    print(f"\n[{gpu}]")
 
     # ── Quantization timing breakdown ─────────────────────────────────────────
-    quant_timings = load_quant_timings(QUANT_TIMING_CSV)
     if quant_timings:
         ref_quant_for_ratio = dq_quant if have_dequant else fu_quant
         plot_quant_breakdown(quant_timings, ref_quant_for_ratio,
-                             os.path.join(RESULTS_DIR, 'quant_time.png'))
+                             os.path.join(gpu_dir, 'quant_time.png'))
     else:
         print("  [skip] quant_time.png — data/quant_timings.csv not found")
 
     # ── Per-path: dequant ─────────────────────────────────────────────────────
     if have_dequant:
         plot_latency_bar(fp16_dq, dq_quant,
-                         os.path.join(DEQUANT_DIR, 'latency_bar.png'),
-                         'dequant + gemm')
+                         os.path.join(dequant_dir, 'latency_bar.png'),
+                         f'dequant + gemm  [{gpu}]')
         plot_bandwidth_bar(fp16_dq, dq_quant,
-                           os.path.join(DEQUANT_DIR, 'bandwidth_bar.png'),
-                           'dequant + gemm')
+                           os.path.join(dequant_dir, 'bandwidth_bar.png'),
+                           f'dequant + gemm  [{gpu}]')
 
     # ── Per-path: fused ───────────────────────────────────────────────────────
     if have_fused:
         plot_latency_bar(fp16_fu, fu_quant,
-                         os.path.join(FUSED_DIR, 'latency_bar.png'),
-                         'fused matvec')
+                         os.path.join(fused_dir, 'latency_bar.png'),
+                         f'fused matvec  [{gpu}]')
         plot_bandwidth_bar(fp16_fu, fu_quant,
-                           os.path.join(FUSED_DIR, 'bandwidth_bar.png'),
-                           'fused matvec')
+                           os.path.join(fused_dir, 'bandwidth_bar.png'),
+                           f'fused matvec  [{gpu}]')
 
-    # ── Comparison (requires both) ────────────────────────────────────────────
-    ref_quant = dq_quant if have_dequant else fu_quant  # quality is path-independent
-
+    # ── Comparison ────────────────────────────────────────────────────────────
+    ref_quant = dq_quant if have_dequant else fu_quant
     plot_quality_vs_k(ref_quant,
-                      os.path.join(RESULTS_DIR, 'quality_vs_k.png'))
+                      os.path.join(gpu_dir, 'quality_vs_k.png'))
 
     if have_both:
         plot_latency_comparison(fp16_dq, dq_quant, fp16_fu, fu_quant,
-                                os.path.join(RESULTS_DIR, 'latency_comparison.png'))
+                                os.path.join(gpu_dir, 'latency_comparison.png'))
         plot_bandwidth_comparison(fp16_dq, dq_quant, fp16_fu, fu_quant,
-                                  os.path.join(RESULTS_DIR, 'bandwidth_comparison.png'))
+                                  os.path.join(gpu_dir, 'bandwidth_comparison.png'))
     else:
         print("  [skip] comparison plots require both dequant and fused CSVs")
+
+
+def main():
+    gpus = discover_gpu_dirs()
+    if not gpus:
+        sys.exit("No results found. Run benchmark_dequant.py and/or benchmark_fused.py first.")
+
+    quant_timings = load_quant_timings(QUANT_TIMING_CSV)
+
+    print("Generating plots...")
+    for gpu in gpus:
+        plot_for_gpu(gpu, quant_timings)
 
     print("\nDone.")
 

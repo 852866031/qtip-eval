@@ -29,9 +29,14 @@ DECODE_MODE = 'quantlut_sym'
 K_BITS      = [2, 3, 4]
 REPEATS     = 200
 
-DATA_DIR    = os.path.join(os.path.dirname(__file__), 'data')
-RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results', 'dequant')
-WX_PATH     = os.path.join(DATA_DIR, 'W_x.pt')
+DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
+WX_PATH  = os.path.join(DATA_DIR, 'W_x.pt')
+
+def gpu_slug():
+    """Return a filesystem-safe GPU name, e.g. 'RTX_5090'."""
+    name = torch.cuda.get_device_name(0)
+    name = name.replace('NVIDIA ', '').replace('GeForce ', '')
+    return name.replace(' ', '_').replace('/', '_')
 
 def quant_path(K):
     return os.path.join(DATA_DIR, f'qtip_K{K}.pt')
@@ -52,6 +57,7 @@ def time_ms(fn, repeats=REPEATS):
 def main():
     if not os.path.exists(WX_PATH):
         sys.exit(f"ERROR: {WX_PATH} not found. Run prepare_qtip.py first.")
+    RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results', gpu_slug(), 'dequant')
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     wx     = torch.load(WX_PATH, weights_only=True)
@@ -134,7 +140,7 @@ def main():
                          ratio=f'{ratio:.2f}', ms=f'{q_ms:.3f}', gb_s=f'{q_bw:.1f}'))
 
     # Save CSV
-    csv_path = os.path.join(RESULTS_DIR, 'results.csv')
+    csv_path = os.path.join(RESULTS_DIR, 'results.csv')  # RESULTS_DIR set at top of main()
     with open(csv_path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=['config','w_mse','out_mse',
                                           'w_bytes','ratio','ms','gb_s'])

@@ -36,9 +36,14 @@ K_BITS      = [2, 3, 4]
 REPEATS     = 200
 SCALE       = 32   # fixed normalisation in BitshiftLinear
 
-DATA_DIR    = os.path.join(os.path.dirname(__file__), 'data')
-RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results', 'fused')
-WX_PATH     = os.path.join(DATA_DIR, 'W_x.pt')
+DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
+WX_PATH  = os.path.join(DATA_DIR, 'W_x.pt')
+
+def gpu_slug():
+    """Return a filesystem-safe GPU name, e.g. 'RTX_5090'."""
+    name = torch.cuda.get_device_name(0)
+    name = name.replace('NVIDIA ', '').replace('GeForce ', '')
+    return name.replace(' ', '_').replace('/', '_')
 
 def quant_path(K):
     return os.path.join(DATA_DIR, f'qtip_K{K}.pt')
@@ -59,6 +64,7 @@ def time_ms(fn, repeats=REPEATS):
 def main():
     if not os.path.exists(WX_PATH):
         sys.exit(f"ERROR: {WX_PATH} not found. Run prepare_qtip.py first.")
+    RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results', gpu_slug(), 'fused')
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     wx     = torch.load(WX_PATH, weights_only=True)
