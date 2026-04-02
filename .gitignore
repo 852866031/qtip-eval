@@ -1,0 +1,27 @@
+# Session context (local only)
+CLAUDE_CONTEXT.md
+
+# Generated artefacts
+data/
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.so
+
+# Conda / virtualenv
+.env
+.venv
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /home/jiaxuan/Documents/Projects/qtip-eval/qtip/*.py)",
+      "Bash(conda run:*)",
+      "Bash(grep -v \"^I0\\\\|^E0\\\\|triton\\\\|def triton\\\\|xnumel\\\\|xoffset\\\\|xindex\\\\|xmask\\\\|x0 =\\\\|x1 =\\\\|x2 =\\\\|tmp\\\\|tl\\\\.\\\\|XBLOCK\\\\|BITS\\\\|BLOCK\\\\|compress\\\\|blocked\\\\|shifts\\\\|indices\\\\|decom\\\\|assert\\\\|expand\\\\|return\\\\|mma\\\\|reshape\\\\|permute\\\\|view\\\\|cat\\\\|roll\\\\|arange\\\\|^$\")"
+    ]
+  }
+}

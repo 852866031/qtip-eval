@@ -1,0 +1,174 @@
+"""
+Benchmark: fused decode+matvec inference path.
+
+Uses the decompress_matvec_qtip CUDA kernel, which decodes the packed trellis
+and accumulates into the output vector in a single pass — the full fp16 weight
+matrix is never written to memory. This is the real production path inside
+BitshiftLinear.forward for batch=1 (single-token generation).
+
+Full operation mirrors BitshiftLinear.forward (rcp=0, batch=1):
+  x_rot = HadUt(x * SU) / scale
+  out_rot = decompress_matvec_qtip(trellis, x_rot, tlut)   # fused
+  out = HadU(out_rot) * (SV * Wscale * scale)
+
+Results saved to results/fused/results.csv.
+Run prepare_qtip.py first to generate data/.
+"""
+import csv
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'qtip'))
+
+import torch
+import torch.utils.benchmark as bench
+
+# Registers torch.ops.quip_lib.decompress_matvec_qtip_* for all known shapes
+import lib.codebook  # noqa: F401
+
+from lib.utils.matmul_had import matmul_hadU_cuda, matmul_hadUt_cuda, get_hadK
+
+# ── Config ────────────────────────────────────────────────────────────────────
+M, N        = 4096, 4096
+L, V        = 16, 2
+TLUT_BITS   = 9
+K_BITS      = [2, 3, 4]
+REPEATS     = 200
+SCALE       = 32   # fixed normalisation in BitshiftLinear
+
+DATA_DIR    = os.path.join(os.path.dirname(__file__), 'data')
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results', 'fused')
+WX_PATH     = os.path.join(DATA_DIR, 'W_x.pt')
+
+def quant_path(K):
+    return os.path.join(DATA_DIR, f'qtip_K{K}.pt')
+
+
+def time_ms(fn, repeats=REPEATS):
+    for _ in range(10):
+        fn()
+    torch.cuda.synchronize()
+    t = bench.Timer(
+        stmt='fn(); torch.cuda.synchronize()',
+        globals={'fn': fn, 'torch': torch},
+        num_threads=1,
+    )
+    return t.timeit(repeats).mean * 1e3
+
+
+def main():
+    if not os.path.exists(WX_PATH):
+        sys.exit(f"ERROR: {WX_PATH} not found. Run prepare_qtip.py first.")
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    wx     = torch.load(WX_PATH, weights_only=True)
+    W_fp32 = wx['W'].float()
+    x      = wx['x']   # fp32 cpu, shape (N,)
+
+    fp16_bytes = W_fp32.numel() * 2
+    ref_out    = W_fp32 @ x
+
+    print(f"\nWeight matrix: {M}×{N}  |  FP16 = {fp16_bytes / 1e6:.1f} MB")
+    print(f"Path: fused matvec  (decompress_matvec_qtip, batch=1, no weight materialisation)\n")
+
+    # FP16 baseline
+    W_fp16_g = W_fp32.half().cuda()
+    x_fp16_g = x.half().cuda()
+    fp16_ms  = time_ms(lambda: W_fp16_g @ x_fp16_g)
+    fp16_bw  = (fp16_bytes + (M + N) * 2) / fp16_ms / 1e6
+
+    # Hadamard params (power-of-2 dims → had=None, K_had=1)
+    had_left,  K_left  = get_hadK(N)
+    had_right, K_right = get_hadK(M)
+
+    rows = []
+
+    hdr = (f"{'Config':<18} {'W MSE':>12} {'Out MSE':>12} "
+           f"{'W bytes':>12} {'Ratio':>7} {'ms':>8} {'GB/s':>8}")
+    print(hdr)
+    print("-" * len(hdr))
+    print(f"{'FP16 baseline':<18} {'—':>12} {'—':>12} "
+          f"{fp16_bytes:>12,} {'1.00x':>7} {fp16_ms:>8.3f} {fp16_bw:>8.1f}")
+    rows.append(dict(config='FP16 baseline', w_mse='', out_mse='',
+                     w_bytes=fp16_bytes, ratio=1.0, ms=fp16_ms, gb_s=fp16_bw))
+
+    for K in K_BITS:
+        path = quant_path(K)
+        if not os.path.exists(path):
+            print(f"  [missing K={K}] run prepare_qtip.py first")
+            continue
+
+        d = torch.load(path, weights_only=True)
+        hatW       = d['hatW']
+        packed     = d['packed']
+        tlut       = d['tlut']
+        SU         = d['SU']
+        SV         = d['SV']
+        Wscale     = float(d['Wscale'])
+        use_kernel = bool(d['use_kernel'])
+
+        if not use_kernel:
+            print(f"{'QTIP K='+str(K):<18}  [fused kernel not available for this shape]")
+            continue
+
+        # Quality (identical to dequant path — same weights, different compute path)
+        w_mse   = (W_fp32 - hatW).pow(2).mean().item()
+        out_mse = (ref_out - hatW @ x).pow(2).mean().item()
+
+        trellis_bytes = packed.numel() * packed.element_size()
+        quant_bytes   = (trellis_bytes
+                         + SU.numel() * 4
+                         + SV.numel() * 4
+                         + (2**TLUT_BITS) * V * 2)
+        ratio = fp16_bytes / quant_bytes
+
+        # GPU tensors
+        packed_g  = packed.cuda()
+        tlut_g    = tlut.half().cuda()
+        SU_g      = SU.cuda()
+        # Wscale absorbed into SV (matches unpack_quip / QuantizedLinear convention)
+        SV_out_g  = (SV * Wscale * SCALE).cuda()
+        x_fp32_g  = x.float().cuda()
+
+        fused_op = getattr(torch.ops.quip_lib,
+                           f"decompress_matvec_qtip_{M}_1_{N}_{K}")
+
+        def fused_matvec():
+            # Rotate input into weight's Hadamard space, normalise by SCALE
+            # x must stay 2D (1, N) — the kernel calls x.T internally
+            x_rot = matmul_hadUt_cuda(
+                (x_fp32_g * SU_g).unsqueeze(0), had_left, K_left
+            ) / SCALE                          # shape: (1, N)
+            # Fused decode + accumulate; output shape: (1, M) fp32
+            out = fused_op(packed_g, x_rot, tlut_g)
+            # Unrotate and apply output scale (SV * Wscale * SCALE)
+            out = matmul_hadU_cuda(out, had_right, K_right)
+            return out * SV_out_g
+
+        q_ms = time_ms(fused_matvec)
+        q_bw = (quant_bytes + (M + N) * 2) / q_ms / 1e6
+
+        print(f"{'QTIP K='+str(K):<18} {w_mse:>12.6f} {out_mse:>12.6f} "
+              f"{quant_bytes:>12,} {ratio:>6.2f}x {q_ms:>8.3f} {q_bw:>8.1f}")
+        rows.append(dict(config=f'QTIP K={K}', w_mse=f'{w_mse:.6f}',
+                         out_mse=f'{out_mse:.6f}', w_bytes=quant_bytes,
+                         ratio=f'{ratio:.2f}', ms=f'{q_ms:.3f}', gb_s=f'{q_bw:.1f}'))
+
+    # Save CSV
+    csv_path = os.path.join(RESULTS_DIR, 'results.csv')
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=['config','w_mse','out_mse',
+                                          'w_bytes','ratio','ms','gb_s'])
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nSaved → {csv_path}")
+
+    print("\nNotes:")
+    print("  W MSE / Out MSE  — computed from hatW on CPU, same for both inference paths")
+    print("  Fused matvec     — decompress_matvec_qtip never writes full fp16 hatW;")
+    print("                     the real latency of batch=1 token generation per layer")
+    print("  GB/s             — (quant weight bytes + x/y IO) / latency")
+
+
+if __name__ == '__main__':
+    main()
