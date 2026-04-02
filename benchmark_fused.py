@@ -61,6 +61,49 @@ def time_ms(fn, repeats=REPEATS):
     return t.timeit(repeats).mean * 1e3
 
 
+def time_breakdown(fused_op, packed_g, tlut_g, SU_g, SV_out_g, x_fp32_g,
+                   had_left, K_left, had_right, K_right, repeats=REPEATS):
+    """
+    Time each step of fused_matvec individually.
+    Each step is timed in isolation (other steps pre-computed) so the numbers
+    are comparable and sum to roughly the total end-to-end latency.
+
+    Steps:
+      input_rot   — (x * SU) → HadUt → /SCALE
+      fused_decode — decompress_matvec_qtip (trellis decode + accumulate)
+      output_rot  — HadU(out)
+      output_scale — out * SV_out
+    """
+    # Pre-compute intermediate tensors so each step can be timed independently
+    x_rot = matmul_hadUt_cuda(
+        (x_fp32_g * SU_g).unsqueeze(0), had_left, K_left
+    ) / SCALE
+    out_fused = fused_op(packed_g, x_rot, tlut_g)
+    out_rot   = matmul_hadU_cuda(out_fused, had_right, K_right)
+    torch.cuda.synchronize()
+
+    def step_input_rot():
+        return matmul_hadUt_cuda(
+            (x_fp32_g * SU_g).unsqueeze(0), had_left, K_left
+        ) / SCALE
+
+    def step_fused_decode():
+        return fused_op(packed_g, x_rot, tlut_g)
+
+    def step_output_rot():
+        return matmul_hadU_cuda(out_fused, had_right, K_right)
+
+    def step_output_scale():
+        return out_rot * SV_out_g
+
+    return {
+        'input_rot_ms':    time_ms(step_input_rot,    repeats),
+        'fused_decode_ms': time_ms(step_fused_decode, repeats),
+        'output_rot_ms':   time_ms(step_output_rot,   repeats),
+        'output_scale_ms': time_ms(step_output_scale, repeats),
+    }
+
+
 def main():
     if not os.path.exists(WX_PATH):
         sys.exit(f"ERROR: {WX_PATH} not found. Run prepare_qtip.py first.")
@@ -90,13 +133,17 @@ def main():
     rows = []
 
     hdr = (f"{'Config':<18} {'W MSE':>12} {'Out MSE':>12} "
-           f"{'W bytes':>12} {'Ratio':>7} {'ms':>8} {'GB/s':>8}")
+           f"{'W bytes':>12} {'Ratio':>7} {'ms':>8} {'GB/s':>8} "
+           f"{'in_rot':>8} {'decode':>8} {'out_rot':>8} {'scale':>8}")
     print(hdr)
     print("-" * len(hdr))
     print(f"{'FP16 baseline':<18} {'—':>12} {'—':>12} "
-          f"{fp16_bytes:>12,} {'1.00x':>7} {fp16_ms:>8.3f} {fp16_bw:>8.1f}")
+          f"{fp16_bytes:>12,} {'1.00x':>7} {fp16_ms:>8.3f} {fp16_bw:>8.1f} "
+          f"{'—':>8} {'—':>8} {'—':>8} {'—':>8}")
     rows.append(dict(config='FP16 baseline', w_mse='', out_mse='',
-                     w_bytes=fp16_bytes, ratio=1.0, ms=fp16_ms, gb_s=fp16_bw))
+                     w_bytes=fp16_bytes, ratio=1.0, ms=fp16_ms, gb_s=fp16_bw,
+                     input_rot_ms='', fused_decode_ms='',
+                     output_rot_ms='', output_scale_ms=''))
 
     for K in K_BITS:
         path = quant_path(K)
@@ -154,17 +201,28 @@ def main():
         q_ms = time_ms(fused_matvec)
         q_bw = (quant_bytes + (M + N) * 2) / q_ms / 1e6
 
+        bd = time_breakdown(fused_op, packed_g, tlut_g, SU_g, SV_out_g, x_fp32_g,
+                            had_left, K_left, had_right, K_right)
+
         print(f"{'QTIP K='+str(K):<18} {w_mse:>12.6f} {out_mse:>12.6f} "
-              f"{quant_bytes:>12,} {ratio:>6.2f}x {q_ms:>8.3f} {q_bw:>8.1f}")
+              f"{quant_bytes:>12,} {ratio:>6.2f}x {q_ms:>8.3f} {q_bw:>8.1f} "
+              f"{bd['input_rot_ms']:>8.3f} {bd['fused_decode_ms']:>8.3f} "
+              f"{bd['output_rot_ms']:>8.3f} {bd['output_scale_ms']:>8.3f}")
         rows.append(dict(config=f'QTIP K={K}', w_mse=f'{w_mse:.6f}',
                          out_mse=f'{out_mse:.6f}', w_bytes=quant_bytes,
-                         ratio=f'{ratio:.2f}', ms=f'{q_ms:.3f}', gb_s=f'{q_bw:.1f}'))
+                         ratio=f'{ratio:.2f}', ms=f'{q_ms:.3f}', gb_s=f'{q_bw:.1f}',
+                         input_rot_ms=f"{bd['input_rot_ms']:.3f}",
+                         fused_decode_ms=f"{bd['fused_decode_ms']:.3f}",
+                         output_rot_ms=f"{bd['output_rot_ms']:.3f}",
+                         output_scale_ms=f"{bd['output_scale_ms']:.3f}"))
 
     # Save CSV
     csv_path = os.path.join(RESULTS_DIR, 'results.csv')
     with open(csv_path, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=['config','w_mse','out_mse',
-                                          'w_bytes','ratio','ms','gb_s'])
+        w = csv.DictWriter(f, fieldnames=['config', 'w_mse', 'out_mse',
+                                          'w_bytes', 'ratio', 'ms', 'gb_s',
+                                          'input_rot_ms', 'fused_decode_ms',
+                                          'output_rot_ms', 'output_scale_ms'])
         w.writeheader()
         w.writerows(rows)
     print(f"\nSaved → {csv_path}")
@@ -174,6 +232,11 @@ def main():
     print("  Fused matvec     — decompress_matvec_qtip never writes full fp16 hatW;")
     print("                     the real latency of batch=1 token generation per layer")
     print("  GB/s             — (quant weight bytes + x/y IO) / latency")
+    print("  in_rot           — (x * SU) → HadUt → /SCALE  [input rotation]")
+    print("  decode           — decompress_matvec_qtip  [trellis decode + accumulate]")
+    print("  out_rot          — HadU(out)  [output rotation]")
+    print("  scale            — out * (SV * Wscale * SCALE)  [output scaling]")
+    print("  Breakdown steps are timed individually; they won't sum exactly to total")
 
 
 if __name__ == '__main__':

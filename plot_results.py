@@ -72,6 +72,21 @@ STEP_LABELS = {
     'postprocess': 'Postprocess\n(pack + reverse rotation)',
 }
 
+# ── Fused inference breakdown constants (must match benchmark_fused.py) ───────
+FUSED_STEPS = ['input_rot_ms', 'fused_decode_ms', 'output_rot_ms', 'output_scale_ms']
+FUSED_STEP_COLORS = {
+    'input_rot_ms':    '#aec6e8',
+    'fused_decode_ms': '#2c6fad',
+    'output_rot_ms':   '#6aaed6',
+    'output_scale_ms': '#c6dbef',
+}
+FUSED_STEP_LABELS = {
+    'input_rot_ms':    'Input rotation\n(x·SU → HadUt / scale)',
+    'fused_decode_ms': 'Fused decode\n(trellis → accumulate)',
+    'output_rot_ms':   'Output rotation\n(HadU)',
+    'output_scale_ms': 'Output scaling\n(· SV·Wscale·scale)',
+}
+
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
@@ -89,29 +104,36 @@ def load_quant_timings(path):
 
 
 def load_csv(path):
-    """Return (fp16_row, {K: row}) parsed from a results CSV."""
+    """Return (fp16_row, {K: row}) parsed from a results CSV.
+
+    Breakdown columns (input_rot_ms etc.) are included when present; None otherwise.
+    """
     if not os.path.exists(path):
         return None, None
     fp16 = None
     quant = {}
     with open(path) as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        for row in reader:
             if row['config'] == 'FP16 baseline':
                 fp16 = {
-                    'ms':   float(row['ms']),
-                    'gb_s': float(row['gb_s']),
+                    'ms':      float(row['ms']),
+                    'gb_s':    float(row['gb_s']),
                     'w_bytes': int(row['w_bytes']),
                 }
             elif row['config'].startswith('QTIP K='):
                 K = int(row['config'].split('=')[1])
-                quant[K] = {
+                entry = {
                     'ms':      float(row['ms']),
                     'gb_s':    float(row['gb_s']),
                     'w_bytes': int(row['w_bytes']),
                     'ratio':   float(row['ratio']),
-                    'w_mse':   float(row['w_mse']) if row['w_mse'] else None,
+                    'w_mse':   float(row['w_mse'])   if row['w_mse']   else None,
                     'out_mse': float(row['out_mse']) if row['out_mse'] else None,
                 }
+                for step in FUSED_STEPS:
+                    entry[step] = float(row[step]) if row.get(step) else None
+                quant[K] = entry
     return fp16, quant
 
 
@@ -182,29 +204,72 @@ def plot_quant_breakdown(timings, quant, out_path):
 
 # ── Per-path plots ────────────────────────────────────────────────────────────
 
+def _has_breakdown(quant):
+    """True if fused breakdown columns are present for at least one K."""
+    return any(quant[k].get('fused_decode_ms') is not None for k in quant)
+
+
 def plot_latency_bar(fp16, quant, out_path, title_suffix):
-    ks     = sorted(quant.keys())
-    labels = ['FP16'] + k_labels(ks)
-    values = [fp16['ms']] + [quant[k]['ms'] for k in ks]
-    colors = [FP16_COLOR] + [K_COLORS[k] for k in ks]
+    ks = sorted(quant.keys())
 
-    fig, (ax, ax_mse) = plt.subplots(1, 2, figsize=(9, 4))
+    has_bd = _has_breakdown(quant)
+    fig, (ax, ax_mse) = plt.subplots(1, 2, figsize=(11, 4))
 
-    bars = ax.bar(labels, values, color=colors, edgecolor='white')
-    ax.bar_label(bars, fmt='%.3f ms', padding=3, fontsize=9)
+    if has_bd:
+        # ── Stacked breakdown bars for fused path ─────────────────────────────
+        k_labels_list = k_labels(ks)
+        # FP16 baseline as a plain bar at the left
+        ax.bar(['FP16'], [fp16['ms']], color=FP16_COLOR, edgecolor='white',
+               label='FP16 baseline')
+        ax.text(0, fp16['ms'], f"{fp16['ms']:.3f}", ha='center', va='bottom',
+                fontsize=8)
+
+        # stacked segments for each K
+        bottoms = [0.0] * len(ks)
+        for step in FUSED_STEPS:
+            vals = [quant[k][step] if quant[k][step] is not None else 0.0
+                    for k in ks]
+            bars = ax.bar(k_labels_list, vals, bottom=bottoms,
+                          color=FUSED_STEP_COLORS[step],
+                          label=FUSED_STEP_LABELS[step],
+                          edgecolor='white', linewidth=0.5)
+            for bar, v in zip(bars, vals):
+                if v > 0.02:   # only annotate segments large enough to read
+                    ax.text(bar.get_x() + bar.get_width() / 2,
+                            bar.get_y() + bar.get_height() / 2,
+                            f'{v:.3f}', ha='center', va='center',
+                            fontsize=7, color='white', fontweight='bold')
+            bottoms = [b + v for b, v in zip(bottoms, vals)]
+
+        # total label above each stacked bar
+        for i, k in enumerate(ks):
+            ax.text(i + 1, bottoms[i], f"{quant[k]['ms']:.3f}",
+                    ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+        ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1),
+                  fontsize=8, framealpha=0.8)
+        ax.set_ylim(0, max(max(bottoms), fp16['ms']) * 1.25)
+
+    else:
+        # ── Plain bars for dequant path ───────────────────────────────────────
+        labels = ['FP16'] + k_labels(ks)
+        values = [fp16['ms']] + [quant[k]['ms'] for k in ks]
+        colors = [FP16_COLOR] + [K_COLORS[k] for k in ks]
+        bars = ax.bar(labels, values, color=colors, edgecolor='white')
+        ax.bar_label(bars, fmt='%.3f ms', padding=3, fontsize=9)
+        ax.set_ylim(0, max(values) * 1.3)
+
     ax.set_ylabel('Latency (ms)')
     ax.set_title(f'Inference latency — {title_suffix}\n(4096×4096 matvec, batch=1)')
-    ax.set_ylim(0, max(values) * 1.3)
     ax.grid(axis='y', alpha=0.3)
 
-    # Out MSE subplot (quantized configs only — FP16 has no quantization error)
+    # ── Out MSE subplot ───────────────────────────────────────────────────────
     mse_ks     = [k for k in ks if quant[k]['out_mse'] is not None]
     mse_vals   = [quant[k]['out_mse'] for k in mse_ks]
-    mse_labels = k_labels(mse_ks)
-    mse_colors = [K_COLORS[k] for k in mse_ks]
 
     if mse_vals:
-        mbars = ax_mse.bar(mse_labels, mse_vals, color=mse_colors, edgecolor='white')
+        mbars = ax_mse.bar(k_labels(mse_ks), mse_vals,
+                           color=[K_COLORS[k] for k in mse_ks], edgecolor='white')
         ax_mse.bar_label(mbars, fmt='%.4f', padding=3, fontsize=8)
         ax_mse.set_ylabel('Output MSE  [mean((Wx − hatW·x)²)]')
         ax_mse.set_title(f'Output error — {title_suffix}\n(fp32 x, N=4096)')
@@ -265,29 +330,48 @@ def plot_quality_vs_k(dq_quant, out_path):
 
 
 def plot_latency_comparison(fp16_dq, dq_quant, fp16_fu, fu_quant, out_path):
-    ks = sorted(dq_quant.keys())
-    x  = np.arange(len(ks))
-    w  = 0.25
+    ks        = sorted(dq_quant.keys())
+    x         = np.arange(len(ks))
+    w         = 0.25
+    has_bd    = _has_breakdown(fu_quant)
 
-    fig, ax = plt.subplots(figsize=(7, 4))
+    fig, ax = plt.subplots(figsize=(9, 4))
 
-    fp16_vals = [fp16_dq['ms']] * len(ks)   # same for both (same hardware)
+    fp16_vals = [fp16_dq['ms']] * len(ks)
     dq_vals   = [dq_quant[k]['ms'] for k in ks]
     fu_vals   = [fu_quant[k]['ms'] for k in ks]
 
-    b0 = ax.bar(x - w,  fp16_vals, w, label='FP16 baseline', color=FP16_COLOR)
-    b1 = ax.bar(x,      dq_vals,   w, label='Dequant + gemm', color=DEQUANT_COLOR)
-    b2 = ax.bar(x + w,  fu_vals,   w, label='Fused matvec',   color=FUSED_COLOR)
+    b0 = ax.bar(x - w, fp16_vals, w, label='FP16 baseline',  color=FP16_COLOR)
+    b1 = ax.bar(x,     dq_vals,   w, label='Dequant + gemm', color=DEQUANT_COLOR)
 
-    for bars in (b0, b1, b2):
+    for bars in (b0, b1):
         ax.bar_label(bars, fmt='%.3f', padding=2, fontsize=7.5, rotation=45)
+
+    if has_bd:
+        # Stacked fused bars
+        bottoms = np.zeros(len(ks))
+        for step in FUSED_STEPS:
+            vals = np.array([fu_quant[k][step] if fu_quant[k][step] is not None else 0.0
+                             for k in ks])
+            ax.bar(x + w, vals, w, bottom=bottoms,
+                   color=FUSED_STEP_COLORS[step],
+                   label=FUSED_STEP_LABELS[step],
+                   edgecolor='white', linewidth=0.5)
+            bottoms += vals
+        # total labels above fused bars
+        for i, k in enumerate(ks):
+            ax.text(x[i] + w, fu_vals[i], f'{fu_vals[i]:.3f}',
+                    ha='center', va='bottom', fontsize=7.5, rotation=45)
+    else:
+        b2 = ax.bar(x + w, fu_vals, w, label='Fused matvec', color=FUSED_COLOR)
+        ax.bar_label(b2, fmt='%.3f', padding=2, fontsize=7.5, rotation=45)
 
     ax.set_xticks(x)
     ax.set_xticklabels(k_labels(ks))
     ax.set_ylabel('Latency (ms)')
     ax.set_title('Inference latency comparison\n(4096×4096 matvec, batch=1)')
-    ax.set_ylim(0, max(dq_vals + fu_vals + fp16_vals) * 1.45)
-    ax.legend(fontsize=9)
+    ax.set_ylim(0, max(dq_vals + fu_vals + fp16_vals) * 1.55)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=8, framealpha=0.8)
     ax.grid(axis='y', alpha=0.3)
     fig.tight_layout()
     savefig(fig, out_path)
