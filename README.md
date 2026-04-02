@@ -39,8 +39,9 @@ conda activate qtip
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install fast-hadamard-transform matplotlib
-pip install -r qtip/requirements.txt
+pip install git+https://github.com/Dao-AILab/fast-hadamard-transform.git --no-build-isolation
+pip install matplotlib
+pip install -r requirements.txt --no-build-isolation
 ```
 
 > If `fast-hadamard-transform` fails to install via pip, build from source:
