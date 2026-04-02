@@ -3,7 +3,6 @@ CLAUDE_CONTEXT.md
 
 # Generated artefacts
 data/
-results/
 
 # Python
 __pycache__/
