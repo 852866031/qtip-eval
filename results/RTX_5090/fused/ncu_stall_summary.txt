@@ -1,0 +1,65 @@
+
+QTIP Fused Decode Kernel — Bottleneck Summary
+==============================================
+
+Paper context (QTIP, NeurIPS 2024 Spotlight):
+  QTIP uses Trellis Coded Quantization (TCQ) with incoherence processing.
+  Weights are encoded as a path through a 2^L = 65536-state trellis (L=16).
+  The HYB code (quantlut_sym, Q=9 tlut_bits) stores a 512-entry tunable LUT
+  per block in shared memory, replicated 32x across warp lanes to avoid bank
+  conflicts → 64KB shared memory per block.
+  The paper claims this design achieves "the same inference throughput as
+  QuIP#" — specifically tuned for Ada (RTX 6000 Ada benchmarks).
+
+Measured bottlenecks (Nsight Compute, RTX 5090, K=2):
+
+  1. math_pipe_throttle (0.00%)  ← LARGEST STALL
+     The trellis decode requires dense integer bit manipulation per weight:
+       idx = reg_c >> (R * j)          -- extract R-bit code
+       idx = idx * (idx + 1)           -- nonlinear hash for LUT index
+       masked_idx = (idx & mask) | lane_id  -- lane-specific LUT offset
+     These integer ops saturate the ALU pipeline (ALU at 28.5% active cycles),
+     creating back-pressure before the LUT lookup or MMA can even fire.
+     This is the direct runtime cost of the paper's "bitshift trellis" —
+     the idx*(idx+1) hash is what gives the LUT its near-uniform coverage of
+     the codebook, but it is also a non-trivial serial compute step.
+
+  2. not_selected (19.54%)
+     Scheduling overhead: warp is ready but another warp was chosen.
+     A consequence of low eligible-warp count (2.07 of 7.90 active per
+     scheduler), itself caused by the other stalls.
+
+  3. long_scoreboard (19.03%) + mio_throttle (9.52%) = 28.55%
+     Waiting for HBM to return packed weight data (ld.global.cs loads).
+     Despite the weight matrix being 8x smaller than FP16, the serial decode
+     chain means packed reads cannot be fully pipelined with compute, so the
+     memory pipeline backs up.
+
+  4. barrier (11.01%)
+     Two __syncthreads() per block: one after codebook load into shared
+     memory, one before the warp-level reduction. The 64KB LUT requirement
+     (fundamental to L=16 trellis) forces 1 block/SM, so there are no other
+     blocks to overlap with during barrier stalls.
+
+  5. wait (7.52%) — fixed-latency arithmetic (MMA result propagation)
+     short_scoreboard (2.29%) — shared memory LUT lookup (surprisingly small)
+
+  Only 6.61% of warp-active cycles are actually issuing instructions.
+
+Root cause (paper-algorithm level):
+  The serial trellis state chain  state[i] → decode w[i] → state[i+1]
+  is mathematically inseparable from TCQ's quality advantage. Each weight's
+  encoding depends on all previous weights' trellis path. This is what
+  achieves near-Shannon-limit rate-distortion — and it is also what prevents
+  any form of instruction-level parallelism within a row's decode sequence.
+  The "bitshift trellis" in the paper reduces the state transition cost
+  (replacing Viterbi search with a shift-register update), but the
+  inter-weight data dependency remains fundamental.
+
+Performance gap vs FP16 (cuBLAS gemv):
+  FP16 gemv reads 32MB at near-peak bandwidth across all 170 SMs with
+  perfect coalescing and no serial dependencies.
+  QTIP fused reads 8x less data (4MB) but with serial decode stalls,
+  42 SMs idle (128/170 blocks), and only 6.49% of cycles doing real work.
+  Quantization reduced bytes but replaced bandwidth cost with serial compute
+  cost — on current hardware, that trade is unfavorable for batch=1.

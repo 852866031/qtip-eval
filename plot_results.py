@@ -73,18 +73,34 @@ STEP_LABELS = {
 }
 
 # ── Fused inference breakdown constants (must match benchmark_fused.py) ───────
-FUSED_STEPS = ['input_rot_ms', 'fused_decode_ms', 'output_rot_ms', 'output_scale_ms']
+FUSED_STEPS = ['input_rot_ms', 'packed_read_ms', 'decode_overhead_ms',
+               'output_rot_ms', 'output_scale_ms']
+
+# ── Kernel-internal phase constants (clock64 measurements) ────────────────────
+KERNEL_STEPS = ['kernel_codebook_ms', 'kernel_loop_ms', 'kernel_reduce_ms']
+KERNEL_STEP_COLORS = {
+    'kernel_codebook_ms': '#fdae6b',
+    'kernel_loop_ms':     '#2c6fad',
+    'kernel_reduce_ms':   '#74c476',
+}
+KERNEL_STEP_LABELS = {
+    'kernel_codebook_ms': 'LUT load\n(smem init)',
+    'kernel_loop_ms':     'Decode loop\n(unpack + LUT + MMA)',
+    'kernel_reduce_ms':   'Reduction\n(warp reduce + write)',
+}
 FUSED_STEP_COLORS = {
-    'input_rot_ms':    '#aec6e8',
-    'fused_decode_ms': '#2c6fad',
-    'output_rot_ms':   '#6aaed6',
-    'output_scale_ms': '#c6dbef',
+    'input_rot_ms':       '#aec6e8',
+    'packed_read_ms':     '#6baed6',
+    'decode_overhead_ms': '#2c6fad',
+    'output_rot_ms':      '#74c476',
+    'output_scale_ms':    '#c6dbef',
 }
 FUSED_STEP_LABELS = {
-    'input_rot_ms':    'Input rotation\n(x·SU → HadUt / scale)',
-    'fused_decode_ms': 'Fused decode\n(trellis → accumulate)',
-    'output_rot_ms':   'Output rotation\n(HadU)',
-    'output_scale_ms': 'Output scaling\n(· SV·Wscale·scale)',
+    'input_rot_ms':       'Input rotation\n(x·SU → HadUt / scale)',
+    'packed_read_ms':     'Decode: HBM read\n(packed trellis → L2)',
+    'decode_overhead_ms': 'Decode: compute\n(unpack + LUT + MMA)',
+    'output_rot_ms':      'Output rotation\n(HadU)',
+    'output_scale_ms':    'Output scaling\n(· SV·Wscale·scale)',
 }
 
 
@@ -131,7 +147,22 @@ def load_csv(path):
                     'w_mse':   float(row['w_mse'])   if row['w_mse']   else None,
                     'out_mse': float(row['out_mse']) if row['out_mse'] else None,
                 }
-                for step in FUSED_STEPS:
+                # Load raw breakdown fields
+                fused_decode = float(row['fused_decode_ms']) if row.get('fused_decode_ms') else None
+                packed_read  = float(row['packed_read_ms'])  if row.get('packed_read_ms')  else None
+                entry['fused_decode_ms']    = fused_decode
+                entry['packed_read_ms']     = packed_read
+                # decode_overhead_ms: derived from the two above.
+                # Falls back to full fused_decode when packed_read not available (old CSVs).
+                if fused_decode is not None and packed_read is not None:
+                    entry['decode_overhead_ms'] = max(0.0, fused_decode - packed_read)
+                else:
+                    entry['decode_overhead_ms'] = fused_decode
+                    entry['packed_read_ms']      = None
+                for step in ('input_rot_ms', 'output_rot_ms', 'output_scale_ms'):
+                    entry[step] = float(row[step]) if row.get(step) else None
+                for step in ('kernel_codebook_ms', 'kernel_loop_ms',
+                             'kernel_reduce_ms', 'kernel_total_ms'):
                     entry[step] = float(row[step]) if row.get(step) else None
                 quant[K] = entry
     return fp16, quant
@@ -206,7 +237,18 @@ def plot_quant_breakdown(timings, quant, out_path):
 
 def _has_breakdown(quant):
     """True if fused breakdown columns are present for at least one K."""
-    return any(quant[k].get('fused_decode_ms') is not None for k in quant)
+    return any(quant[k].get('decode_overhead_ms') is not None for k in quant)
+
+
+def _sorted_steps(quant):
+    """Return FUSED_STEPS sorted largest-mean-first (largest segment at bottom)."""
+    ks = sorted(quant.keys())
+    mean_val = {
+        step: np.mean([quant[k][step] for k in ks
+                       if quant[k].get(step) is not None])
+        for step in FUSED_STEPS
+    }
+    return sorted(FUSED_STEPS, key=lambda s: mean_val[s], reverse=True)
 
 
 def plot_latency_bar(fp16, quant, out_path, title_suffix):
@@ -224,9 +266,9 @@ def plot_latency_bar(fp16, quant, out_path, title_suffix):
         ax.text(0, fp16['ms'], f"{fp16['ms']:.3f}", ha='center', va='bottom',
                 fontsize=8)
 
-        # stacked segments for each K
+        # stacked segments for each K — sorted largest→smallest (bottom→top)
         bottoms = [0.0] * len(ks)
-        for step in FUSED_STEPS:
+        for step in _sorted_steps(quant):
             vals = [quant[k][step] if quant[k][step] is not None else 0.0
                     for k in ks]
             bars = ax.bar(k_labels_list, vals, bottom=bottoms,
@@ -299,6 +341,66 @@ def plot_bandwidth_bar(fp16, quant, out_path, title_suffix):
     savefig(fig, out_path)
 
 
+# ── Kernel-internal breakdown plot ───────────────────────────────────────────
+
+def plot_kernel_breakdown(fu_quant, out_path, title_suffix):
+    """Stacked kernel-internal phase bars, normalized to fused_decode_ms.
+
+    %globaltimer on Blackwell counts only active SM execution (not memory stall
+    cycles), so raw values are ~200x smaller than wall clock.  The proportions
+    across phases are still accurate, so we scale each phase by
+      fused_decode_ms / kernel_total_ms
+    to express them in real milliseconds that sum to fused_decode_ms.
+    """
+    ks = sorted(k for k in fu_quant
+                if fu_quant[k].get('kernel_loop_ms') is not None
+                and fu_quant[k].get('kernel_total_ms'))
+    if not ks:
+        return
+
+    k_lbls = k_labels(ks)
+    x = np.arange(len(ks))
+    w = 0.5
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+
+    bottoms = np.zeros(len(ks))
+    for step in KERNEL_STEPS:
+        # Scale raw globaltimer fraction to wall-clock ms
+        scaled = np.array([
+            (fu_quant[k][step] or 0.0)
+            / fu_quant[k]['kernel_total_ms']
+            * fu_quant[k]['fused_decode_ms']
+            for k in ks
+        ])
+        bars = ax.bar(x, scaled, w, bottom=bottoms,
+                      color=KERNEL_STEP_COLORS[step],
+                      label=KERNEL_STEP_LABELS[step],
+                      edgecolor='white', linewidth=0.5)
+        for bar, v in zip(bars, scaled):
+            if v > 0.01:
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_y() + bar.get_height() / 2,
+                        f'{v:.3f}', ha='center', va='center',
+                        fontsize=7, color='white', fontweight='bold')
+        bottoms += scaled
+
+    for i, k in enumerate(ks):
+        ax.text(x[i], bottoms[i], f"{fu_quant[k]['fused_decode_ms']:.3f}",
+                ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(k_lbls)
+    ax.set_ylabel('Time (ms)')
+    ax.set_title(f'Kernel phase breakdown — {title_suffix}\n'
+                 f'(globaltimer proportions × fused_decode wall-clock, 4096×4096)')
+    ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=8, framealpha=0.8)
+    ax.grid(axis='y', alpha=0.3)
+    ax.set_ylim(0, np.max(bottoms) * 1.3)
+    fig.tight_layout()
+    savefig(fig, out_path)
+
+
 # ── Comparison plots ──────────────────────────────────────────────────────────
 
 def plot_quality_vs_k(dq_quant, out_path):
@@ -348,9 +450,9 @@ def plot_latency_comparison(fp16_dq, dq_quant, fp16_fu, fu_quant, out_path):
         ax.bar_label(bars, fmt='%.3f', padding=2, fontsize=7.5, rotation=45)
 
     if has_bd:
-        # Stacked fused bars
+        # Stacked fused bars — sorted largest→smallest (bottom→top)
         bottoms = np.zeros(len(ks))
-        for step in FUSED_STEPS:
+        for step in _sorted_steps(fu_quant):
             vals = np.array([fu_quant[k][step] if fu_quant[k][step] is not None else 0.0
                              for k in ks])
             ax.bar(x + w, vals, w, bottom=bottoms,
@@ -448,6 +550,9 @@ def plot_for_gpu(gpu, quant_timings):
         plot_bandwidth_bar(fp16_fu, fu_quant,
                            os.path.join(fused_dir, 'bandwidth_bar.png'),
                            f'fused matvec  [{gpu}]')
+        plot_kernel_breakdown(fu_quant,
+                              os.path.join(fused_dir, 'kernel_breakdown.png'),
+                              f'fused matvec  [{gpu}]')
 
     # ── Comparison ────────────────────────────────────────────────────────────
     ref_quant = dq_quant if have_dequant else fu_quant

@@ -25,6 +25,7 @@ import torch.utils.benchmark as bench
 
 # Registers torch.ops.quip_lib.decompress_matvec_qtip_* for all known shapes
 import lib.codebook  # noqa: F401
+import qtip_kernels
 
 from lib.utils.matmul_had import matmul_hadU_cuda, matmul_hadUt_cuda, get_hadK
 
@@ -69,10 +70,12 @@ def time_breakdown(fused_op, packed_g, tlut_g, SU_g, SV_out_g, x_fp32_g,
     are comparable and sum to roughly the total end-to-end latency.
 
     Steps:
-      input_rot   — (x * SU) → HadUt → /SCALE
-      fused_decode — decompress_matvec_qtip (trellis decode + accumulate)
-      output_rot  — HadU(out)
-      output_scale — out * SV_out
+      input_rot      — (x * SU) → HadUt → /SCALE
+      fused_decode   — decompress_matvec_qtip (trellis decode + accumulate)
+        packed_read  — proxy: read all packed bytes from HBM (memory floor)
+        decode_overhead — derived: fused_decode - packed_read (compute cost)
+      output_rot     — HadU(out)
+      output_scale   — out * SV_out
     """
     # Pre-compute intermediate tensors so each step can be timed independently
     x_rot = matmul_hadUt_cuda(
@@ -96,11 +99,78 @@ def time_breakdown(fused_op, packed_g, tlut_g, SU_g, SV_out_g, x_fp32_g,
     def step_output_scale():
         return out_rot * SV_out_g
 
+    def step_packed_read():
+        # Proxy for the pure HBM read cost of the packed trellis data.
+        # Forces all packed bytes through the memory hierarchy (L2 → HBM)
+        # without any decode compute. This is the theoretical minimum time
+        # that the fused decode kernel could take if it were purely memory-bound.
+        return packed_g.sum()
+
+    fused_decode_ms = time_ms(step_fused_decode, repeats)
+    packed_read_ms  = time_ms(step_packed_read,  repeats)
+
     return {
-        'input_rot_ms':    time_ms(step_input_rot,    repeats),
-        'fused_decode_ms': time_ms(step_fused_decode, repeats),
-        'output_rot_ms':   time_ms(step_output_rot,   repeats),
-        'output_scale_ms': time_ms(step_output_scale, repeats),
+        'input_rot_ms':       time_ms(step_input_rot,   repeats),
+        'fused_decode_ms':    fused_decode_ms,
+        'packed_read_ms':     packed_read_ms,
+        'decode_overhead_ms': max(0.0, fused_decode_ms - packed_read_ms),
+        'output_rot_ms':      time_ms(step_output_rot,  repeats),
+        'output_scale_ms':    time_ms(step_output_scale, repeats),
+    }
+
+
+def time_kernel_internal(K, packed_g, x_rot, tlut_g, repeats=REPEATS):
+    """
+    Call the clock64()-instrumented kernel variant to measure time spent in
+    each phase inside the CUDA kernel itself (averaged over 128 blocks).
+
+    Phases:
+      codebook  — loading the LUT into shared memory
+      loop      — the ki loop: trellis unpack + LUT lookup + MMA accumulate
+      reduce    — warp-level reduction + write output
+      total     — codebook + loop + reduce (full kernel wall time per SM)
+
+    Returns dict of *_ms keys (converted from nanoseconds via globaltimer).
+    """
+    # globaltimer gives nanoseconds; no clock rate needed
+    timing = torch.zeros(128 * 4, dtype=torch.int64, device='cuda')
+    out    = torch.zeros((M, 1), dtype=torch.float32, device='cuda')
+
+    timed_fn = getattr(qtip_kernels,
+                       f"decompress_matvec_timed_16_9_{K}_1_{M}_1_{N}")
+
+    # Warm up
+    for _ in range(5):
+        timing.zero_()
+        out.zero_()
+        timed_fn(out,
+                 packed_g.reshape(-1).view(torch.int32),
+                 x_rot.to(torch.float16).T,
+                 tlut_g.reshape(-1),
+                 timing)
+    torch.cuda.synchronize()
+
+    # Collect across repeats (accumulate, then average)
+    accum = torch.zeros(4, dtype=torch.float64, device='cuda')
+    for _ in range(repeats):
+        timing.zero_()
+        out.zero_()
+        timed_fn(out,
+                 packed_g.reshape(-1).view(torch.int32),
+                 x_rot.to(torch.float16).T,
+                 tlut_g.reshape(-1),
+                 timing)
+        torch.cuda.synchronize()
+        # timing: [128*4] int64 → (128, 4); mean over blocks
+        accum += timing.view(128, 4).double().mean(dim=0)
+
+    means = (accum / repeats).cpu()  # [codebook, loop, reduce, total] in nanoseconds
+    to_ms = lambda c: (c / 1e6).item()  # ns → ms
+    return {
+        'kernel_codebook_ms': to_ms(means[0]),
+        'kernel_loop_ms':     to_ms(means[1]),
+        'kernel_reduce_ms':   to_ms(means[2]),
+        'kernel_total_ms':    to_ms(means[3]),
     }
 
 
@@ -134,16 +204,20 @@ def main():
 
     hdr = (f"{'Config':<18} {'W MSE':>12} {'Out MSE':>12} "
            f"{'W bytes':>12} {'Ratio':>7} {'ms':>8} {'GB/s':>8} "
-           f"{'in_rot':>8} {'decode':>8} {'out_rot':>8} {'scale':>8}")
+           f"{'in_rot':>8} {'decode':>8} {'out_rot':>8} {'scale':>8} "
+           f"{'k_cb':>8} {'k_loop':>8} {'k_red':>8} {'k_tot':>8}")
     print(hdr)
     print("-" * len(hdr))
     print(f"{'FP16 baseline':<18} {'—':>12} {'—':>12} "
           f"{fp16_bytes:>12,} {'1.00x':>7} {fp16_ms:>8.3f} {fp16_bw:>8.1f} "
+          f"{'—':>8} {'—':>8} {'—':>8} {'—':>8} "
           f"{'—':>8} {'—':>8} {'—':>8} {'—':>8}")
     rows.append(dict(config='FP16 baseline', w_mse='', out_mse='',
                      w_bytes=fp16_bytes, ratio=1.0, ms=fp16_ms, gb_s=fp16_bw,
-                     input_rot_ms='', fused_decode_ms='',
-                     output_rot_ms='', output_scale_ms=''))
+                     input_rot_ms='', fused_decode_ms='', packed_read_ms='',
+                     decode_overhead_ms='', output_rot_ms='', output_scale_ms='',
+                     kernel_codebook_ms='', kernel_loop_ms='',
+                     kernel_reduce_ms='', kernel_total_ms=''))
 
     for K in K_BITS:
         path = quant_path(K)
@@ -204,17 +278,34 @@ def main():
         bd = time_breakdown(fused_op, packed_g, tlut_g, SU_g, SV_out_g, x_fp32_g,
                             had_left, K_left, had_right, K_right)
 
+        # Pre-compute x_rot for kernel-internal timing (same as time_breakdown uses)
+        x_rot_for_timing = matmul_hadUt_cuda(
+            (x_fp32_g * SU_g).unsqueeze(0), had_left, K_left
+        ) / SCALE
+        kd = time_kernel_internal(K, packed_g, x_rot_for_timing, tlut_g)
+
         print(f"{'QTIP K='+str(K):<18} {w_mse:>12.6f} {out_mse:>12.6f} "
               f"{quant_bytes:>12,} {ratio:>6.2f}x {q_ms:>8.3f} {q_bw:>8.1f} "
               f"{bd['input_rot_ms']:>8.3f} {bd['fused_decode_ms']:>8.3f} "
-              f"{bd['output_rot_ms']:>8.3f} {bd['output_scale_ms']:>8.3f}")
+              f"(mem={bd['packed_read_ms']:.3f} cmp={bd['decode_overhead_ms']:.3f}) "
+              f"{bd['output_rot_ms']:>8.3f} {bd['output_scale_ms']:>8.3f} "
+              f"  kernel: cb={kd['kernel_codebook_ms']:.3f} "
+              f"loop={kd['kernel_loop_ms']:.3f} "
+              f"red={kd['kernel_reduce_ms']:.3f} "
+              f"tot={kd['kernel_total_ms']:.3f}")
         rows.append(dict(config=f'QTIP K={K}', w_mse=f'{w_mse:.6f}',
                          out_mse=f'{out_mse:.6f}', w_bytes=quant_bytes,
                          ratio=f'{ratio:.2f}', ms=f'{q_ms:.3f}', gb_s=f'{q_bw:.1f}',
                          input_rot_ms=f"{bd['input_rot_ms']:.3f}",
                          fused_decode_ms=f"{bd['fused_decode_ms']:.3f}",
+                         packed_read_ms=f"{bd['packed_read_ms']:.3f}",
+                         decode_overhead_ms=f"{bd['decode_overhead_ms']:.3f}",
                          output_rot_ms=f"{bd['output_rot_ms']:.3f}",
-                         output_scale_ms=f"{bd['output_scale_ms']:.3f}"))
+                         output_scale_ms=f"{bd['output_scale_ms']:.3f}",
+                         kernel_codebook_ms=f"{kd['kernel_codebook_ms']:.4f}",
+                         kernel_loop_ms=f"{kd['kernel_loop_ms']:.4f}",
+                         kernel_reduce_ms=f"{kd['kernel_reduce_ms']:.4f}",
+                         kernel_total_ms=f"{kd['kernel_total_ms']:.4f}"))
 
     # Save CSV
     csv_path = os.path.join(RESULTS_DIR, 'results.csv')
@@ -222,7 +313,10 @@ def main():
         w = csv.DictWriter(f, fieldnames=['config', 'w_mse', 'out_mse',
                                           'w_bytes', 'ratio', 'ms', 'gb_s',
                                           'input_rot_ms', 'fused_decode_ms',
-                                          'output_rot_ms', 'output_scale_ms'])
+                                          'packed_read_ms', 'decode_overhead_ms',
+                                          'output_rot_ms', 'output_scale_ms',
+                                          'kernel_codebook_ms', 'kernel_loop_ms',
+                                          'kernel_reduce_ms', 'kernel_total_ms'])
         w.writeheader()
         w.writerows(rows)
     print(f"\nSaved → {csv_path}")
@@ -237,6 +331,11 @@ def main():
     print("  out_rot          — HadU(out)  [output rotation]")
     print("  scale            — out * (SV * Wscale * SCALE)  [output scaling]")
     print("  Breakdown steps are timed individually; they won't sum exactly to total")
+    print("  kernel_* cols  — clock64() SM-cycle timing inside the CUDA kernel")
+    print("    k_cb   = LUT load into shared memory (one-time per block)")
+    print("    k_loop = ki loop: trellis unpack + LUT lookup + MMA accumulate")
+    print("    k_red  = warp-level reduction + write output")
+    print("    k_tot  = total kernel time from SM clock (should ≈ fused_decode_ms)")
 
 
 if __name__ == '__main__':
