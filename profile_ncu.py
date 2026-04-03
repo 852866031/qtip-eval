@@ -96,15 +96,21 @@ def run_ncu(k_bits):
 def parse_metrics(text):
     """
     Parse ncu text output into {metric_name: float}.
-    Drops _pipe_ sub-breakdown duplicates (they equal the parent metric).
+    Drops sub-breakdown duplicates like long_scoreboard_pipe_l1tex and
+    mio_throttle_pipe_mio (they equal their parent metric).
+    Keeps math_pipe_throttle, which contains '_pipe_' but is a top-level metric.
     """
     metrics = {}
     pattern = r'(smsp__warp_issue_stalled\S+)\s+%\s+([\d.]+)'
     for match in re.finditer(pattern, text):
         name  = match.group(1)
         value = float(match.group(2))
-        if '_pipe_' in name:
-            continue   # sub-breakdown duplicate of parent metric
+        # Skip only sub-breakdown duplicates: these have '_pipe_' followed by
+        # a pipeline name (l1tex, mio, etc.) *after* the stall category.
+        # Pattern: stalled_{category}_pipe_{pipeline}_per_warp_active
+        # Do NOT skip math_pipe_throttle, which has _pipe_ as part of the category name.
+        if re.search(r'stalled_\w+_pipe_\w+_per_warp', name):
+            continue
         metrics[name] = value
     return metrics
 
