@@ -187,75 +187,122 @@ completion is measured.
 
 # Report
 
-All numbers below are on the setup listed above (RTX 5090, 7B, 256-token
-decode, 3 trials per cell). The `e2e/` mean is the arithmetic mean across
-the 3 trials; the `decomp/` mean is across 200 timed ops per row.
+All numbers below come from the scripts in this repo on the setup listed
+above (RTX 5090, Llama-2-7B, 256-token decode, 3 trials per cell for
+e2e; 200 timed ops per row for decomp). Absolute tok/s and µs depend on
+GPU memory bandwidth, so we avoid cross-hardware ratios and stick to
+internal comparisons (our eager vs our graph, our method A vs our method
+B) where units are always explicit.
 
-## Summary table — end-to-end (`e2e/`)
+## End-to-end throughput (`e2e/`)
 
-Llama-2-7B, bs=1 decode throughput in tokens/second.
+Llama-2-7B bs=1 decode, mean tok/s across 3 trials.
 
-| mode → <br> method ↓ | eager (no graph) | graph (`torch.compile(max-autotune)`) | graph / eager |
-|---|---:|---:|---:|
-| **FP16**          | **71.3**  | **116.6** | 1.63× |
-| **QTIP-4bit**     | **4.4**   | **204.8** | **46.9×** |
-| **QTIP / FP16**   | **0.06×** | **1.76×** |  |
-| paper value (RTX6000 Ada)    | — |  140 / 55.9 = 2.51× | — |
+| method    | eager (tok/s) | graph (tok/s) | graph / eager (×) |
+|-----------|--------------:|--------------:|------------------:|
+| FP16      |          71.3 |         116.6 |             1.63  |
+| QTIP-4bit |           4.4 |         204.8 |            46.92  |
 
-Two observations that are the whole point of this report:
+![e2e throughput bar chart](e2e/plot/throughput_bar.png)
 
-1. **The sign of "is QTIP-4bit faster than FP16?" flips with the runtime
-   mode.** In eager PyTorch the same QTIP-4bit model is **16× slower** than
-   FP16. In graph mode it's **1.76× faster**, which reproduces the paper's
-   claim (2.51× on their slower-memory-BW GPU, ~1.8× expected on a 5090
-   because FP16 already runs closer to its BW roof here).
-2. **CUDA graphs give the FP16 path a modest 1.6× gain, but give the
-   QTIP-4bit path a ~47× gain.** The two methods are not equally sensitive
-   to graph capture by any stretch — and the qualitative conclusion about
-   QTIP depends entirely on which side of that asymmetry you're measuring
-   on.
+![e2e graph speedup](e2e/plot/graph_speedup.png)
 
-## Summary table — matvec decomposition (`decomp/`)
+The bar chart makes the qualitative finding obvious at a glance. In
+**eager** mode (faded bars) QTIP-4bit sits at 4.4 tok/s against FP16's
+71.3 — the quantized path is an order of magnitude slower than the
+unquantized baseline. In **graph** mode (hatched bars) that order
+completely reverses: QTIP-4bit climbs to ~205 tok/s and FP16 only to
+~117, so the quantized path is ~1.75× faster. Same model, same kernel
+binaries, same GPU; the only thing that changed is whether the decode
+loop is wrapped in `torch.compile(max-autotune, fullgraph=True)`.
 
-Per-matvec latency in microseconds, mean of 200 ops. FP16 has no
-bit-width axis; quantized paths (Path B dequant+matmul, Path C QTIP fused)
-are reported at 4 bits (the same pattern holds at 2 and 3).
+The right-hand plot isolates "how much does each method gain from
+CUDA-graph capture?". FP16 gains 1.63× — roughly what you'd expect from
+avoiding per-call Python / launch overhead. QTIP-4bit gains **46.9×**.
+That two-orders-of-magnitude asymmetry is the headline finding.
 
-| shape | method (4-bit) | eager | graph | graph / eager |
-|---|---|---:|---:|---:|
-| **(4096, 4096)**  | FP16 cuBLAS matvec          | 22.4  | 17.4  | 1.29× |
-|                   | Dequant + matmul (LB)       | 35.3  | 30.7  | 1.15× |
-|                   | **QTIP fused**              | **863** | **8.2** | **105×** |
-| **(4096, 11008)** | FP16 cuBLAS matvec          | 54.2  | 30.9  | 1.75× |
-|                   | Dequant + matmul (LB)       | 146.7 | 141.1 | 1.04× |
-|                   | **QTIP fused**              | **1033** | **18.3** | **56×** |
-| **(11008, 4096)** | FP16 cuBLAS matvec          | 51.1  | 28.9  | 1.77× |
-|                   | Dequant + matmul (LB)       | 141.7 | 135.7 | 1.04× |
-|                   | **QTIP fused**              | **1031** | **20.5** | **50×** |
+## Matvec-level decomposition (`decomp/`)
 
-The graph/eager ratio per path is essentially shape-independent: FP16
-cuBLAS gains ~1.3–1.8×, dequant+matmul gains ~1.0–1.2×, QTIP fused gains
-~50–100×. Across bit-widths (2/3/4) within the QTIP fused row, the ratio
-shifts only a little — the effect is about the kernel's cold-launch
-profile, not about how much data it moves.
+Per-matvec latency at 4-bit, µs, mean of 200 ops. (Same pattern holds at
+2-bit and 3-bit; the `decomp/output/*.json` files carry all of it.)
 
-Effective bandwidth on the graph-mode QTIP-fused path reaches ~1 TB/s
-(e.g. 4-bit `down_proj`: 1233 GB/s against compressed bytes on a
-~1800 GB/s GPU), consistent with the paper's claim that the kernel runs
-near the HBM roof when the runtime lets it.
+### Shape (4096, 4096) — q / k / v / o projections
+
+| method                 | eager (µs) | graph (µs) | graph / eager (×) |
+|------------------------|-----------:|-----------:|------------------:|
+| FP16 cuBLAS matvec     |       22.4 |       17.4 |              1.29 |
+| Dequant + matmul (LB)  |       35.3 |       30.7 |              1.15 |
+| QTIP fused             |      863.0 |        8.2 |            105.24 |
+
+### Shape (4096, 11008) — down projection
+
+| method                 | eager (µs) | graph (µs) | graph / eager (×) |
+|------------------------|-----------:|-----------:|------------------:|
+| FP16 cuBLAS matvec     |       54.2 |       30.9 |              1.75 |
+| Dequant + matmul (LB)  |      146.7 |      141.1 |              1.04 |
+| QTIP fused             |     1032.8 |       18.3 |             56.44 |
+
+### Shape (11008, 4096) — gate / up projections
+
+| method                 | eager (µs) | graph (µs) | graph / eager (×) |
+|------------------------|-----------:|-----------:|------------------:|
+| FP16 cuBLAS matvec     |       51.1 |       28.9 |              1.77 |
+| Dequant + matmul (LB)  |      141.7 |      135.7 |              1.04 |
+| QTIP fused             |     1031.3 |       20.5 |             50.31 |
+
+![decomp per-shape latency (4096,4096)](decomp/plot/matvec_time_4096x4096.png)
+![decomp per-shape latency (4096,11008)](decomp/plot/matvec_time_4096x11008.png)
+![decomp per-shape latency (11008,4096)](decomp/plot/matvec_time_11008x4096.png)
+
+Each of the three per-shape bar charts uses a log-y axis because the
+QTIP-fused eager bar would otherwise squash everything else flat. Notice
+that within each shape group:
+
+- **FP16 cuBLAS** (grey) and **dequant+matmul** (red) bars are nearly the
+  same height under eager vs graph — no log scaling would be needed for
+  those two alone.
+- **QTIP fused** (blue) towers over the other two in eager mode, then
+  drops to the smallest bar in graph mode. That's the asymmetry in one
+  frame.
+- Dequant+matmul in eager mode is *already* slower than FP16 — which
+  confirms the separate point the decomposition was designed to check:
+  any "stage fp16 weight through HBM" strategy pays 2× the weight memory
+  traffic of FP16 and can't beat it even in principle.
+
+![decomp graph speedup](decomp/plot/graph_speedup.png)
+
+The graph-speedup plot (log-y) shows the same two-orders-of-magnitude
+gap at the matvec level that the e2e experiment shows end-to-end: FP16
+and dequant bars sit close to 1× (with some shape-dependent wobble),
+while the QTIP fused bars sit at 50–115×.
+
+![decomp effective bandwidth](decomp/plot/matvec_bandwidth.png)
+
+The bandwidth panel is the most informative for the positive claim about
+QTIP. The y-axis is effective bandwidth (GB/s, log scale): FP16's
+denominator is fp16-weight bytes; the two quantized paths' denominator is
+compressed-weight bytes, so bars aren't cross-method comparable but
+within a method the bar height tracks how close to the HBM roof the
+implementation is running.
+Under graph capture (hatched), the QTIP-fused bars reach several hundred
+to ~1200 GB/s — a real fraction of the 5090's ~1.8 TB/s peak. Under
+eager (faded) the fused bars collapse to tens of GB/s.
+The cold-launch overhead turns a kernel that would be memory-roof-limited
+into one that is launch-and-cold-ramp-limited.
 
 ## Cross-check: the two experiments tell the same story
 
-The matvec-level asymmetry (FP16 gains ~1.5× from graph, QTIP fused gains
-~50–100×) predicts the end-to-end asymmetry (FP16 gains 1.6×, QTIP-4bit
-gains 47×) quite well. They're not identical because end-to-end decode
-includes non-matvec work (attention, LM head, sampling) that isn't
-affected by the fused kernel, which damps the ratio. But they point the
-same direction at roughly the same magnitude, and they're measured
-independently — decomp on synthetic inputs with `torch.utils.benchmark`,
-e2e on real Llama-2-7B generation with the full HF forward pass. The
-consistency rules out "this is a measurement artefact" and points at a
-structural kernel property.
+The matvec-level asymmetry (FP16 gains ~1.3–1.8× from graph, QTIP fused
+gains ~50–105×) is consistent with the end-to-end asymmetry (FP16 gains
+1.6×, QTIP-4bit gains 46.9×). They're not identical because end-to-end
+decode also runs attention, the LM head, and sampling, which aren't
+hosted by the fused kernel and damp the ratio down from ~50–100× to
+~47×. But they point in the same direction at roughly the same
+magnitude, and the two measurements are independent — decomp on
+synthetic inputs using `torch.utils.benchmark.Timer` / CUDA graphs
+directly; e2e on real Llama-2-7B generation through the full HF forward
+pass with `torch.compile`. The consistency rules out measurement
+artefact and points at a structural property of the fused kernel.
 
 ## Discussion — why is the QTIP fused kernel so graph-sensitive?
 
