@@ -69,6 +69,47 @@ def decode_one(model, cur_token, past_kv, cache_position):
 
 
 @torch.no_grad()
+def decode_one_greedy(model, cur_token, past_kv, cache_position):
+    """Forward + deterministic argmax; returns (last_logits, next_token).
+
+    Used for the logit-capture pass so eager and graph runs can be diffed
+    without stochastic sampling masking any kernel-level differences.
+    """
+    logits = model(cur_token, past_key_values=past_kv,
+                   cache_position=cache_position)[0]
+    last = logits[:, -1, :]
+    next_token = torch.argmax(last, dim=-1, keepdim=True).to(dtype=torch.int)
+    return last, next_token
+
+
+@torch.no_grad()
+def run_greedy_capture(model, tokenizer, text, max_new_tokens, past_kv, decode_greedy_fn):
+    """Deterministic greedy generation; returns (logits [T, vocab], tokens [T])."""
+    inputs = tokenizer(text, return_tensors='pt').to(0)
+    _, seq_len = inputs['input_ids'].shape
+    cache_position = torch.arange(seq_len, device=0)
+    past_kv.reset()
+
+    # Prefill: model returns full logits tensor; take last-token row.
+    prefill_logits = model(**inputs, past_key_values=past_kv,
+                           cache_position=cache_position)[0][:, -1, :]
+    next_token = torch.argmax(prefill_logits, dim=-1, keepdim=True).to(dtype=torch.int)
+
+    logits_acc = [prefill_logits.detach().to('cpu', torch.float32)]
+    token_acc = [next_token.detach().cpu().view(-1)]
+
+    cache_position = torch.tensor([seq_len + 1], device=0)
+    for _ in range(1, max_new_tokens):
+        last, next_token = decode_greedy_fn(model, next_token.clone(),
+                                            past_kv, cache_position)
+        logits_acc.append(last.detach().to('cpu', torch.float32))
+        token_acc.append(next_token.detach().cpu().view(-1))
+        cache_position += 1
+
+    return torch.cat(logits_acc, dim=0), torch.cat(token_acc, dim=0)
+
+
+@torch.no_grad()
 def run_generate(model, tokenizer, text, max_new_tokens, past_kv):
     inputs = tokenizer(text, return_tensors='pt').to(0)
     _, seq_len = inputs['input_ids'].shape
@@ -122,6 +163,15 @@ def main():
     print(f'\n[e2e:{LABEL}] RESULT  best={best:.2f}  mean={mean:.2f} tok/s  '
           f'(n={len(tps)})')
 
+    # Logit-capture run (eager greedy decode, fixed prompt, deterministic).
+    print(f'[e2e:{LABEL}] capturing logits under greedy decoding ...')
+    logits, tokens = run_greedy_capture(model, tokenizer, PROMPT,
+                                        MAX_NEW_TOKENS, past_kv,
+                                        decode_one_greedy)
+    print(f'[e2e:{LABEL}] captured logits shape={tuple(logits.shape)}  '
+          f'tokens shape={tuple(tokens.shape)}')
+    print(f'[e2e:{LABEL}] sample decoded: {tokenizer.decode(tokens[:40].tolist())!r}')
+
     out_dir = os.path.join(E2E_DIR, 'output')
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f'{LABEL}.json')
@@ -141,6 +191,19 @@ def main():
             'gpu': torch.cuda.get_device_name(0),
         }, f, indent=2)
     print(f'[e2e:{LABEL}] wrote {out_path}')
+
+    logits_path = os.path.join(out_dir, f'{LABEL}_logits.pt')
+    torch.save({
+        'label': LABEL,
+        'mode': 'eager (no torch.compile, no CUDA graph); greedy sampling',
+        'hf_path': HF_PATH,
+        'prompt': PROMPT,
+        'max_new_tokens': MAX_NEW_TOKENS,
+        'logits': logits,       # [T, vocab] fp32 on CPU
+        'tokens': tokens,       # [T] int on CPU
+        'gpu': torch.cuda.get_device_name(0),
+    }, logits_path)
+    print(f'[e2e:{LABEL}] wrote {logits_path}')
 
 
 if __name__ == '__main__':

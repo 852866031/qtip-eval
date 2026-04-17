@@ -6,13 +6,13 @@
   "n_trials": 3,
   "prompt": "This is a test of this large language model",
   "trials_tok_s": [
-    198.86452749135782,
-    207.73019542279715,
-    207.74020168259173
+    197.90896037185618,
+    199.17319700398718,
+    199.17560791020716
   ],
-  "best_tok_s": 207.74020168259173,
-  "mean_tok_s": 204.7783081989156,
-  "load_seconds": 1.6237781047821045,
+  "best_tok_s": 199.17560791020716,
+  "mean_tok_s": 198.75258842868354,
+  "load_seconds": 1.6482036113739014,
   "quantized": true,
   "gpu": "NVIDIA GeForce RTX 5090"
 }
