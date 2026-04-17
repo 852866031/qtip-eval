@@ -1,0 +1,18 @@
+{
+  "label": "fp16_eager",
+  "mode": "eager (no torch.compile, no CUDA graph)",
+  "hf_path": "meta-llama/Llama-2-7b-hf",
+  "max_new_tokens": 256,
+  "n_trials": 3,
+  "prompt": "This is a test of this large language model",
+  "trials_tok_s": [
+    71.31196314212086,
+    71.28821648472928,
+    71.29866192456636
+  ],
+  "best_tok_s": 71.31196314212086,
+  "mean_tok_s": 71.29961385047217,
+  "load_seconds": 1.8581852912902832,
+  "quantized": false,
+  "gpu": "NVIDIA GeForce RTX 5090"
+}

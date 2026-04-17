@@ -1,0 +1,18 @@
+{
+  "label": "fp16_graph",
+  "mode": "torch.compile(max-autotune, fullgraph=True) -- CUDA graph capture",
+  "hf_path": "meta-llama/Llama-2-7b-hf",
+  "max_new_tokens": 256,
+  "n_trials": 3,
+  "prompt": "This is a test of this large language model",
+  "trials_tok_s": [
+    116.28010224366595,
+    116.40237626607127,
+    116.97446920066186
+  ],
+  "best_tok_s": 116.97446920066186,
+  "mean_tok_s": 116.55231590346636,
+  "load_seconds": 1.7955729961395264,
+  "quantized": false,
+  "gpu": "NVIDIA GeForce RTX 5090"
+}

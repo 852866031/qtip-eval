@@ -1,0 +1,18 @@
+{
+  "label": "qtip4bit_graph",
+  "mode": "torch.compile(max-autotune, fullgraph=True) -- CUDA graph capture",
+  "hf_path": "relaxml/Llama-2-7b-QTIP-4Bit",
+  "max_new_tokens": 256,
+  "n_trials": 3,
+  "prompt": "This is a test of this large language model",
+  "trials_tok_s": [
+    198.86452749135782,
+    207.73019542279715,
+    207.74020168259173
+  ],
+  "best_tok_s": 207.74020168259173,
+  "mean_tok_s": 204.7783081989156,
+  "load_seconds": 1.6237781047821045,
+  "quantized": true,
+  "gpu": "NVIDIA GeForce RTX 5090"
+}

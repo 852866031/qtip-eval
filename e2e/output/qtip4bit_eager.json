@@ -1,0 +1,18 @@
+{
+  "label": "qtip4bit_eager",
+  "mode": "eager (no torch.compile, no CUDA graph)",
+  "hf_path": "relaxml/Llama-2-7b-QTIP-4Bit",
+  "max_new_tokens": 256,
+  "n_trials": 3,
+  "prompt": "This is a test of this large language model",
+  "trials_tok_s": [
+    4.3586613242244905,
+    4.357838769843008,
+    4.3585973976193335
+  ],
+  "best_tok_s": 4.3586613242244905,
+  "mean_tok_s": 4.358365830562278,
+  "load_seconds": 1.624600887298584,
+  "quantized": true,
+  "gpu": "NVIDIA GeForce RTX 5090"
+}

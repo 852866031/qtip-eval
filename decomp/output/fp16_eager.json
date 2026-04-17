@@ -1,0 +1,37 @@
+{
+  "label": "fp16_eager",
+  "method": "FP16 cuBLAS matvec",
+  "timer": "eager (torch.utils.benchmark.Timer, fn; sync per iter)",
+  "repeats": 200,
+  "warmup": 10,
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "rows": [
+    {
+      "shape_mk": [
+        4096,
+        4096
+      ],
+      "time_us": 22.446025000135705,
+      "bytes_weight": 33554432,
+      "effective_gbps": 1494.8941739037152
+    },
+    {
+      "shape_mk": [
+        4096,
+        11008
+      ],
+      "time_us": 54.24487999789562,
+      "bytes_weight": 90177536,
+      "effective_gbps": 1662.4156234376103
+    },
+    {
+      "shape_mk": [
+        11008,
+        4096
+      ],
+      "time_us": 51.053754996246425,
+      "bytes_weight": 90177536,
+      "effective_gbps": 1766.3252390863324
+    }
+  ]
+}

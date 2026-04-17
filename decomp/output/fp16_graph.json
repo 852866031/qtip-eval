@@ -1,0 +1,37 @@
+{
+  "label": "fp16_graph",
+  "method": "FP16 cuBLAS matvec",
+  "timer": "CUDA graph replay + explicit host sync before end event",
+  "iter": 200,
+  "warmup": 50,
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "rows": [
+    {
+      "shape_mk": [
+        4096,
+        4096
+      ],
+      "time_us": 17.36016035079956,
+      "bytes_weight": 33554432,
+      "effective_gbps": 1932.8411329135322
+    },
+    {
+      "shape_mk": [
+        4096,
+        11008
+      ],
+      "time_us": 30.941760540008545,
+      "bytes_weight": 90177536,
+      "effective_gbps": 2914.4280876777516
+    },
+    {
+      "shape_mk": [
+        11008,
+        4096
+      ],
+      "time_us": 28.90511989593506,
+      "bytes_weight": 90177536,
+      "effective_gbps": 3119.777268686635
+    }
+  ]
+}

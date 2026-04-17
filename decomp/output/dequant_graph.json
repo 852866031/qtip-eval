@@ -1,0 +1,109 @@
+{
+  "label": "dequant_graph",
+  "method": "dequant + fp16 matmul (LB)",
+  "timer": "CUDA graph replay + explicit host sync before end event",
+  "iter": 200,
+  "warmup": 50,
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "rows": [
+    {
+      "shape_mk": [
+        4096,
+        4096
+      ],
+      "bits": 2,
+      "time_us": 29.794559478759766,
+      "dequant_only_us": 14.358079433441162,
+      "bytes_compressed": 4194304,
+      "effective_gbps": 140.7741572077975
+    },
+    {
+      "shape_mk": [
+        4096,
+        4096
+      ],
+      "bits": 3,
+      "time_us": 30.095999240875244,
+      "dequant_only_us": 14.371039867401123,
+      "bytes_compressed": 6291456,
+      "effective_gbps": 209.0462572664869
+    },
+    {
+      "shape_mk": [
+        4096,
+        4096
+      ],
+      "bits": 4,
+      "time_us": 30.74608087539673,
+      "dequant_only_us": 14.366240501403809,
+      "bytes_compressed": 8388608,
+      "effective_gbps": 272.83503331680345
+    },
+    {
+      "shape_mk": [
+        4096,
+        11008
+      ],
+      "bits": 2,
+      "time_us": 141.1348819732666,
+      "dequant_only_us": 117.8166389465332,
+      "bytes_compressed": 11272192,
+      "effective_gbps": 79.86822139501382
+    },
+    {
+      "shape_mk": [
+        4096,
+        11008
+      ],
+      "bits": 3,
+      "time_us": 141.03055953979492,
+      "dequant_only_us": 117.79935836791992,
+      "bytes_compressed": 16908288,
+      "effective_gbps": 119.89095168575113
+    },
+    {
+      "shape_mk": [
+        4096,
+        11008
+      ],
+      "bits": 4,
+      "time_us": 141.11231803894043,
+      "dequant_only_us": 117.6524829864502,
+      "bytes_compressed": 22544384,
+      "effective_gbps": 159.76198473175674
+    },
+    {
+      "shape_mk": [
+        11008,
+        4096
+      ],
+      "bits": 2,
+      "time_us": 136.69983863830566,
+      "dequant_only_us": 117.69375801086426,
+      "bytes_compressed": 11272192,
+      "effective_gbps": 82.45943895972776
+    },
+    {
+      "shape_mk": [
+        11008,
+        4096
+      ],
+      "bits": 3,
+      "time_us": 135.6816005706787,
+      "dequant_only_us": 117.73200035095215,
+      "bytes_compressed": 16908288,
+      "effective_gbps": 124.61739785559357
+    },
+    {
+      "shape_mk": [
+        11008,
+        4096
+      ],
+      "bits": 4,
+      "time_us": 135.70112228393555,
+      "dequant_only_us": 117.57632255554199,
+      "bytes_compressed": 22544384,
+      "effective_gbps": 166.13262750199692
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+{
+  "label": "qtip_graph",
+  "method": "QTIP fused decompress+matvec",
+  "timer": "CUDA graph replay + explicit host sync before end event",
+  "iter": 200,
+  "warmup": 50,
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "rows": [
+    {
+      "shape_mk": [
+        4096,
+        4096
+      ],
+      "bits": 2,
+      "time_us": 8.254560232162476,
+      "bytes_compressed": 4194304,
+      "effective_gbps": 508.1196189783213
+    },
+    {
+      "shape_mk": [
+        4096,
+        4096
+      ],
+      "bits": 3,
+      "time_us": 8.243680000305176,
+      "bytes_compressed": 6291456,
+      "effective_gbps": 763.1853734942518
+    },
+    {
+      "shape_mk": [
+        4096,
+        4096
+      ],
+      "bits": 4,
+      "time_us": 8.244959712028503,
+      "bytes_compressed": 8388608,
+      "effective_gbps": 1017.4225579006686
+    },
+    {
+      "shape_mk": [
+        4096,
+        11008
+      ],
+      "bits": 2,
+      "time_us": 12.402080297470093,
+      "bytes_compressed": 11272192,
+      "effective_gbps": 908.8952602814078
+    },
+    {
+      "shape_mk": [
+        4096,
+        11008
+      ],
+      "bits": 3,
+      "time_us": 14.387840032577515,
+      "bytes_compressed": 16908288,
+      "effective_gbps": 1175.1790374174016
+    },
+    {
+      "shape_mk": [
+        4096,
+        11008
+      ],
+      "bits": 4,
+      "time_us": 18.271360397338867,
+      "bytes_compressed": 22544384,
+      "effective_gbps": 1233.8645568659178
+    },
+    {
+      "shape_mk": [
+        11008,
+        4096
+      ],
+      "bits": 2,
+      "time_us": 14.394400119781494,
+      "bytes_compressed": 11272192,
+      "effective_gbps": 783.0956417912269
+    },
+    {
+      "shape_mk": [
+        11008,
+        4096
+      ],
+      "bits": 3,
+      "time_us": 16.33520007133484,
+      "bytes_compressed": 16908288,
+      "effective_gbps": 1035.0830064010556
+    },
+    {
+      "shape_mk": [
+        11008,
+        4096
+      ],
+      "bits": 4,
+      "time_us": 20.522239208221436,
+      "bytes_compressed": 22544384,
+      "effective_gbps": 1098.534315444899
+    }
+  ]
+}

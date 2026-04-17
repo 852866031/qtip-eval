@@ -1,0 +1,33 @@
+# Cloned upstream source trees -- re-clone as per README setup instructions.
+# We do not vendor them to avoid double-tracking Cornell-RelaxML/qtip and
+# Dao-AILab/fast-hadamard-transform. Their own .git dirs would also break
+# `git add` from this repo.
+qtip/
+fast-hadamard-transform/
+
+# Python / build / tooling artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Conda / venv (in case anyone creates one in-tree)
+.env
+.venv/
+env/
+venv/
+
+# Claude Code agent metadata (not relevant to the project)
+.claude/
+
+# HF cache if anyone ever redirects it into the tree
+.cache/
